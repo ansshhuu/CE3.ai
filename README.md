@@ -1,36 +1,121 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# CE3.ai
 
-## Getting Started
+AI chargeback defence for Razorpay merchants.
 
-First, run the development server:
+CE3.ai ingests disputes from Razorpay, scores each one for win probability and
+expected value, checks Visa Compelling Evidence 3.0 (CE3.0) eligibility, assembles
+the evidence the network actually requires for that reason code, and drafts a
+grounded rebuttal for a human to approve before submission.
+
+> **Status:** early build-out. The database schema is in place; the application
+> surface is still a Next.js scaffold.
+
+## Stack
+
+| Layer      | Choice                                        |
+| ---------- | --------------------------------------------- |
+| App        | Next.js 14 (App Router), TypeScript, Tailwind |
+| UI         | shadcn/ui, Recharts, Sonner                   |
+| Database   | Supabase (Postgres + RLS + pgvector)          |
+| Payments   | Razorpay                                      |
+| Queue      | Upstash QStash + Redis                        |
+| LLM        | OpenRouter                                    |
+| Scoring    | external ML service (`ML_SERVICE_URL`)        |
+| Tests      | Vitest                                        |
+
+## Getting started
 
 ```bash
+npm install
+cp .env.local.example .env.local   # then fill in the values
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Environment
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+All keys live in `.env.local` (gitignored). See `.env.local.example` for the full
+list — Supabase URL/anon/service-role, Razorpay key/secret/webhook secret,
+OpenRouter, the ML service URL and shared secret, Upstash Redis + QStash, Resend,
+and `APP_BASE_URL`.
 
-## Learn More
+Only `NEXT_PUBLIC_*` values reach the browser. `SUPABASE_SERVICE_ROLE_KEY`
+bypasses Row Level Security entirely — server-side use only, never in a client
+component.
 
-To learn more about Next.js, take a look at the following resources:
+## Database
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+The schema lives in [supabase/migrations/](supabase/migrations/) and is the source
+of truth. Apply it with the Supabase CLI:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+npm i -g supabase          # one-time
+supabase login
+supabase link --project-ref <your-project-ref>
+supabase db push
+```
 
-## Deploy on Vercel
+Or run it locally against Docker:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+supabase start
+supabase db reset          # replays every migration into the local DB
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Without the CLI, paste the whole of `supabase/migrations/0001_init.sql` into the
+Supabase Dashboard SQL Editor and run it as a single query. Enable the `vector`
+and `pgcrypto` extensions first under **Database → Extensions** if the
+`create extension` lines fail.
+
+### Schema overview
+
+| Table                   | Purpose                                                        |
+| ----------------------- | -------------------------------------------------------------- |
+| `merchants`             | Tenant root — Razorpay credentials, fight-fee and cost economics, risk threshold |
+| `users`                 | Dashboard users, `id` = `auth.uid()`, scoped to one merchant    |
+| `customers`             | Buyer history — lifetime GMV, prior disputes, returns           |
+| `orders`                | Transaction + fulfilment record, the evidentiary backbone       |
+| `disputes`              | Razorpay dispute, its reason code, deadline and final verdict    |
+| `dispute_scores`        | Versioned model output — win probability, EV, SHAP attributions |
+| `evidence_artifacts`    | Uploaded documents, one per Razorpay evidence slot              |
+| `evidence_requirements` | Global reference: reason code → required evidence, with embeddings |
+| `ce3_checks`            | Visa CE3.0 eligibility result and matched data elements          |
+| `rebuttals`             | Versioned LLM drafts with per-sentence claim grounding           |
+| `audit_log`             | Append-only record of every action                               |
+| `model_runs`            | ML training registry — metrics, thresholds, cost curves          |
+
+### Row Level Security
+
+RLS is enabled on all twelve tables.
+
+- **Merchant-scoped** (`merchants`, `users`, `customers`, `orders`, `disputes`,
+  `evidence_artifacts`): rows are visible only to users whose `merchant_id`
+  matches. `dispute_scores`, `ce3_checks` and `rebuttals` carry no `merchant_id`
+  of their own and are scoped through their parent dispute.
+- **`audit_log`** is insert-only. No update or delete policy exists, and both are
+  revoked outright; `select` is restricted to users with the `admin` role.
+- **`evidence_requirements` and `model_runs`** are global reference tables:
+  readable by any authenticated user, writable only via the service-role key
+  (which bypasses RLS).
+
+Two helper functions, `current_merchant_id()` and `is_merchant_admin()`, back the
+policies. Both are `security definer` so a user can resolve their own merchant
+without needing a readable path into `users`.
+
+## Testing
+
+```bash
+npm test          # single run
+npm run test:watch
+```
+
+## Scripts
+
+| Command         | Does                          |
+| --------------- | ----------------------------- |
+| `npm run dev`   | Development server            |
+| `npm run build` | Production build              |
+| `npm start`     | Serve the production build    |
+| `npm run lint`  | ESLint                        |
+| `npm test`      | Vitest, single run            |
